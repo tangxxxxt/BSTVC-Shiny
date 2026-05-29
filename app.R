@@ -23,24 +23,32 @@
 ####################################################################################################
 options(shiny.maxRequestSize = 1024 * 1024^2)
 
-# required_packages <- c(
-#   "shiny", "bs4Dash", "DT", "sf", "dplyr", "leaflet",
-#   "BSTVC", "openxlsx", "readxl", "spdep", "waiter"
-# )
-# 
-# missing_packages <- required_packages[
-#   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
-# ]
-# 
-# if (length(missing_packages) > 0) {
-#   stop(
-#     sprintf(
-#       "缺少必要 R 包：%s。请先安装这些包后再运行应用。",
-#       paste(missing_packages, collapse = ", ")
-#     ),
-#     call. = FALSE
-#   )
-# }
+# 自动安装用于动态载入本地包的辅助工具
+if (!requireNamespace("pkgload", quietly = TRUE)) install.packages("pkgload")
+
+# 1. 动态载入本地的 BSTVC 文件夹
+# 因为 runGitHub 会把整个仓库下载到本地临时目录，所以用相对路径就能直接找到
+if (dir.exists("local_packages/BSTVC")) {
+  message("正在从本地文件夹载入 BSTVC 包...")
+  pkgload::load_all("local_packages/BSTVC")
+} else {
+  # 如果本地没有文件夹，留一个备用方案
+  if (!requireNamespace("BSTVC", quietly = TRUE)) {
+    remotes::install_github("songbi123/BSTVC")
+    library(BSTVC)
+  }
+}
+
+# 2. 其他标准 CRAN 包依然自动检测安装
+required_packages <- c("shiny", "bs4Dash", "DT", "sf", "dplyr", "leaflet", "openxlsx", "readxl", "spdep","waiter")
+missing_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+if (length(missing_packages) > 0) {
+  install.packages(missing_packages, repos = "https://mirrors.tuna.tsinghua.edu.cn/CRAN/")
+}
+lapply(required_packages, library, character.only = TRUE)
+
+
+
 
 library(shiny)
 library(bs4Dash)
