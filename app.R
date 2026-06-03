@@ -23,32 +23,24 @@
 ####################################################################################################
 options(shiny.maxRequestSize = 1024 * 1024^2)
 
-# 自动安装用于动态载入本地包的辅助工具
-if (!requireNamespace("pkgload", quietly = TRUE)) install.packages("pkgload")
-
-# 1. 动态载入本地的 BSTVC 文件夹
-# 因为 runGitHub 会把整个仓库下载到本地临时目录，所以用相对路径就能直接找到
-if (dir.exists("local_packages/BSTVC")) {
-  message("正在从本地文件夹载入 BSTVC 包...")
-  pkgload::load_all("local_packages/BSTVC")
-} else {
-  # 如果本地没有文件夹，留一个备用方案
-  if (!requireNamespace("BSTVC", quietly = TRUE)) {
-    remotes::install_github("songbi123/BSTVC")
-    library(BSTVC)
-  }
-}
-
-# 2. 其他标准 CRAN 包依然自动检测安装
-required_packages <- c("shiny", "bs4Dash", "DT", "sf", "dplyr", "leaflet", "openxlsx", "readxl", "spdep","waiter")
-missing_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
-if (length(missing_packages) > 0) {
-  install.packages(missing_packages, repos = "https://mirrors.tuna.tsinghua.edu.cn/CRAN/")
-}
-lapply(required_packages, library, character.only = TRUE)
-
-
-
+# required_packages <- c(
+#   "shiny", "bs4Dash", "DT", "sf", "dplyr", "leaflet",
+#   "BSTVC", "openxlsx", "readxl", "spdep", "waiter"
+# )
+# 
+# missing_packages <- required_packages[
+#   !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+# ]
+# 
+# if (length(missing_packages) > 0) {
+#   stop(
+#     sprintf(
+#       "缺少必要 R 包：%s。请先安装这些包后再运行应用。",
+#       paste(missing_packages, collapse = ", ")
+#     ),
+#     call. = FALSE
+#   )
+# }
 
 library(shiny)
 library(bs4Dash)
@@ -286,27 +278,281 @@ logo_src_2 <- figure_src("R_logo_pic.png")
 # 单元排列一致。这里先可靠读取数据、地图和可选空间权重矩阵，再提供顺序检查函数。
 ####################################################################################################
 
-# 读取建模数据。CSV 用基础 read.csv，Excel 用 readxl；check.names = FALSE 是为了保留用户原始
-# 字段名，避免界面中看到的列名和原文件不一致。
+# 读取建模数据。CSV 会自动尝试 UTF-8、GB18030/GBK 等常见中文编码；Excel 用 readxl。
+# check.names = FALSE 是为了保留用户原始字段名，避免界面中看到的列名和原文件不一致。
+normalize_uploaded_text <- function(x) {
+  if (!is.character(x)) return(x)
+
+  y <- tryCatch(
+    enc2utf8(x),
+    error = function(e) iconv(x, from = "", to = "UTF-8", sub = "byte")
+  )
+  invalid <- !is.na(y) & is.na(iconv(y, from = "UTF-8", to = "UTF-8"))
+  if (any(invalid)) {
+    y[invalid] <- iconv(x[invalid], from = "", to = "UTF-8", sub = "byte")
+  }
+  y
+}
+
+normalize_uploaded_data_frame <- function(df) {
+  df <- as.data.frame(df, stringsAsFactors = FALSE, check.names = FALSE)
+  names(df) <- normalize_uploaded_text(names(df))
+
+  for (nm in names(df)) {
+    if (is.character(df[[nm]]) || is.factor(df[[nm]])) {
+      df[[nm]] <- normalize_uploaded_text(as.character(df[[nm]]))
+    }
+  }
+
+  df
+}
+
+read_csv_with_encoding <- function(path, encoding_label) {
+  args <- list(
+    file = path,
+    stringsAsFactors = FALSE,
+    check.names = FALSE,
+    comment.char = "",
+    na.strings = c("", "NA", "NaN")
+  )
+
+  if (!identical(encoding_label, "default")) {
+    args$fileEncoding <- encoding_label
+  }
+
+  warnings_seen <- character(0)
+  df <- withCallingHandlers(
+    do.call(utils::read.csv, args),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    }
+  )
+
+  encoding_warning <- grepl(
+    "invalid input|invalid multibyte|multi-byte|多字节|编码",
+    warnings_seen,
+    ignore.case = TRUE
+  )
+  if (any(encoding_warning)) {
+    stop(paste(unique(warnings_seen[encoding_warning]), collapse = "；"), call. = FALSE)
+  }
+
+  normalize_uploaded_data_frame(df)
+}
+
+safe_read_csv_data <- function(upload_info) {
+  encodings <- c("UTF-8", "UTF-8-BOM", "GB18030", "GBK", "CP936", "GB2312", "default")
+  errors <- character(0)
+
+  for (enc in encodings) {
+    dat <- tryCatch(
+      read_csv_with_encoding(upload_info$datapath, enc),
+      error = function(e) {
+        errors <<- c(errors, sprintf("%s: %s", enc, conditionMessage(e)))
+        NULL
+      }
+    )
+
+    if (!is.null(dat)) {
+      if (ncol(dat) == 0) {
+        errors <- c(errors, sprintf("%s: 未读取到任何列。", enc))
+        next
+      }
+      if (nrow(dat) == 0) {
+        errors <- c(errors, sprintf("%s: 只读取到表头，没有读取到任何数据行；这通常是编码不匹配或 CSV 文件实际为空导致的。", enc))
+        next
+      }
+      if (any(is.na(names(dat))) || any(!nzchar(trimws(names(dat))))) {
+        errors <- c(errors, sprintf("%s: 数据中存在空列名，请先在原始文件中补充列名。", enc))
+        next
+      }
+      attr(dat, "bstvc_csv_encoding") <- enc
+      return(dat)
+    }
+  }
+
+  stop(
+    paste(
+      c(
+        "CSV 文件读取失败。请确认文件不是损坏文件、不是只有表头没有数据行，并优先使用 UTF-8 或 GBK/GB18030 编码保存。",
+        "系统已自动尝试 UTF-8、UTF-8-BOM、GB18030、GBK、CP936、GB2312 和默认编码。",
+        "各编码尝试结果：",
+        errors
+      ),
+      collapse = "\n"
+    ),
+    call. = FALSE
+  )
+}
+
 safe_read_data <- function(upload_info) {
   req(upload_info)
   ext <- tolower(tools::file_ext(upload_info$name))
 
   if (identical(ext, "csv")) {
-    return(read.csv(upload_info$datapath, stringsAsFactors = FALSE, check.names = FALSE))
+    return(safe_read_csv_data(upload_info))
   }
 
   if (ext %in% c("xlsx", "xls")) {
-    return(as.data.frame(readxl::read_excel(upload_info$datapath), stringsAsFactors = FALSE))
+    dat <- as.data.frame(readxl::read_excel(upload_info$datapath), stringsAsFactors = FALSE)
+    return(normalize_uploaded_data_frame(dat))
   }
 
   stop("建模表格数据仅支持 csv、xlsx 或 xls 文件！")
 }
-
 # Shiny 上传 shapefile 时，浏览器会把每个文件放到临时路径中；如果只把 .shp 临时文件交给
 # sf::st_read()，它在同一临时目录下找不到 .dbf/.shx 等配套文件，地图属性表就会丢失。
 # 因此界面允许用户选择 shapefile 文件组，程序内部把这些文件按原文件名复制到同一临时目录，
 # 再像本地 R 代码 st_read("NAT.shp") 一样读取主 .shp 文件。
+
+# 识别上传表格更像空间截面宽表还是时空面板长表。用户的列名规则可能不同，因此这里只做
+# 温和提示，真正转换仍以用户手动选择的字段和时间序列为准。
+detect_panel_data_type <- function(dat) {
+  if (is.null(dat) || !is.data.frame(dat) || ncol(dat) == 0) {
+    return(list(type = "idle", class = "info", lines = "请先上传并读取待转换的原始数据。"))
+  }
+
+  cols <- names(dat)
+  lower_cols <- tolower(cols)
+  likely_time_cols <- cols[
+    lower_cols %in% c("year", "time", "date", "month") |
+      grepl("年份|年度|时间|月份|日期", cols)
+  ]
+  likely_wide_cols <- cols[
+    grepl("(^|[^0-9])(18|19|20)[0-9]{2}([^0-9]|$)", cols) |
+      grepl("^[0-9]{4}$", cols) |
+      grepl("^[0-9]{6}$", cols)
+  ]
+
+  if (length(likely_time_cols) == 1 && length(likely_wide_cols) <= 1) {
+    return(list(
+      type = "panel",
+      class = "success",
+      lines = c(
+        sprintf("数据格式判断：时空面板格式（长表）。检测到一个时间字段：%s。", likely_time_cols[1]),
+        "如果原始数据已经是时空面板长表，可直接进入“数据输入”；如需强制转换，仍可在下方设置参数。"
+      )
+    ))
+  }
+
+  if (length(likely_wide_cols) >= 2) {
+    return(list(
+      type = "wide",
+      class = "warning",
+      lines = c(
+        sprintf("数据格式判断：空间截面格式（宽表，每个时间点是一列）。检测到 %d 个含时间信息的列名。", length(likely_wide_cols)),
+        "请在下方按变量选择各自的时间序列列，并确保每个变量的列数与输入的时间序列长度完全一致。"
+      )
+    ))
+  }
+
+  list(
+    type = "unknown",
+    class = "info",
+    lines = c(
+      "数据格式判断：暂无法确认。",
+      "若每个时间点是一列，请按空间截面宽表继续设置转换参数；若已有唯一时间字段，则可直接进入“数据输入”。"
+    )
+  )
+}
+
+parse_numeric_time_sequence <- function(x) {
+  x <- trimws(x %||% "")
+  if (!nzchar(x)) {
+    stop("请输入时间序列，例如 2000:2021、2000,2001,2002 或 1:12。", call. = FALSE)
+  }
+
+  compact <- gsub("\\s+", "", x)
+  if (grepl("^-?[0-9]+(\\.[0-9]+)?[:-]-?[0-9]+(\\.[0-9]+)?$", compact)) {
+    parts <- strsplit(compact, "[:-]")[[1]]
+    start <- as.numeric(parts[1])
+    end <- as.numeric(parts[2])
+    if (is.na(start) || is.na(end)) {
+      stop("时间序列必须能转换为数值型。", call. = FALSE)
+    }
+    step <- if (start <= end) 1 else -1
+    return(seq(start, end, by = step))
+  }
+
+  pieces <- strsplit(x, "[,，;；\\s\\n\\r]+")[[1]]
+  pieces <- pieces[nzchar(trimws(pieces))]
+  values <- suppressWarnings(as.numeric(pieces))
+  if (length(values) == 0 || any(is.na(values))) {
+    stop("时间序列必须为数值型，请使用英文逗号、空格或冒号范围输入。", call. = FALSE)
+  }
+  values
+}
+
+
+build_panel_conversion <- function(dat, id_cols, time_values, time_col, specs) {
+  if (is.null(dat) || !is.data.frame(dat) || nrow(dat) == 0) {
+    stop("请先读取待转换的原始数据。", call. = FALSE)
+  }
+  if (length(id_cols) == 0) {
+    stop("请选择至少一个 id 列。", call. = FALSE)
+  }
+  if (!all(id_cols %in% names(dat))) {
+    stop("部分 id 列不存在于原始数据中。", call. = FALSE)
+  }
+  if (!nzchar(trimws(time_col))) {
+    stop("请输入新时间列的列名。", call. = FALSE)
+  }
+  if (time_col %in% id_cols) {
+    stop("新时间列名不能与 id 列重名。", call. = FALSE)
+  }
+  if (length(time_values) == 0) {
+    stop("时间序列不能为空。", call. = FALSE)
+  }
+
+  value_names <- vapply(specs, function(x) trimws(x$value_name %||% ""), character(1))
+  if (any(!nzchar(value_names))) {
+    stop("每个变量都必须填写转换后的数值列名。", call. = FALSE)
+  }
+  if (anyDuplicated(value_names) > 0) {
+    stop("转换后的数值列名不能重复。", call. = FALSE)
+  }
+  if (any(value_names %in% c(id_cols, time_col))) {
+    stop("转换后的数值列名不能与 id 列或新时间列重名。", call. = FALSE)
+  }
+
+  expected_len <- length(time_values)
+  for (i in seq_along(specs)) {
+    measure_cols <- specs[[i]]$measure_cols %||% character(0)
+    value_name <- value_names[i]
+
+    if (length(measure_cols) == 0) {
+      stop(sprintf("第 %d 个变量（%s）尚未选择需要转换的列。", i, value_name), call. = FALSE)
+    }
+    if (!all(measure_cols %in% names(dat))) {
+      stop(sprintf("第 %d 个变量（%s）包含原始数据中不存在的列。", i, value_name), call. = FALSE)
+    }
+    if (length(measure_cols) != expected_len) {
+      stop(
+        sprintf(
+          "第 %d 个变量（%s）的列数为 %d，但时间序列长度为 %d。必须保证每个变量的时间序列数完全一致；请补齐缺失时间点，空值填 NA 后重新上传。",
+          i,
+          value_name,
+          length(measure_cols),
+          expected_len
+        ),
+        call. = FALSE
+      )
+    }
+  }
+
+  row_index <- rep(seq_len(nrow(dat)), times = expected_len)
+  converted <- dat[row_index, id_cols, drop = FALSE]
+  rownames(converted) <- NULL
+  converted[[time_col]] <- rep(time_values, each = nrow(dat))
+
+  for (i in seq_along(specs)) {
+    measure_cols <- specs[[i]]$measure_cols
+    converted[[value_names[i]]] <- unlist(dat[measure_cols], use.names = FALSE)
+  }
+
+  converted
+}
 safe_read_shp_upload <- function(upload_info) {
   req(upload_info)
 
@@ -863,6 +1109,7 @@ ui <- bs4DashPage(
     bs4SidebarMenu(
       id = "tabs",
       bs4SidebarMenuItem("概览", tabName = "overview", icon = icon("house"), selected = TRUE),
+      bs4SidebarMenuItem("空间截面数据转换", tabName = "spatial_convert", icon = icon("shuffle")),
       bs4SidebarMenuItem("数据输入", tabName = "input", icon = icon("database")),
       bs4SidebarMenuItem("数据检查", tabName = "check", icon = icon("list-check")),
       tagAppendAttributes(
@@ -975,7 +1222,97 @@ ui <- bs4DashPage(
           margin: 8px 0 12px 0;
           background: #fbfdfc;
         }
-        .run-btn, .download-btn {
+        .convert-banner {
+          background: #ffffff;
+          border: 1px solid #dfece6;
+          border-left: 5px solid #3D9970;
+          border-radius: 8px;
+          color: #263c31;
+          font-weight: 600;
+          line-height: 1.8;
+          margin-bottom: 14px;
+          padding: 12px 16px;
+        }
+        .convert-banner i {
+          color: #d9822b;
+          margin-right: 8px;
+        }
+        .convert-banner strong {
+          color: #2f7a5a;
+        }
+        .convert-banner-bottom {
+          margin-top: 4px;
+        }
+        .convert-type-alert {
+          line-height: 1.7;
+          margin-bottom: 0;
+        }
+        .convert-type-alert h4 {
+          margin-bottom: 10px;
+        }
+        .convert-detail {
+          padding: 0;
+        }
+        .convert-detail summary {
+          color: #2f7a5a;
+          cursor: pointer;
+          font-weight: 700;
+          list-style: none;
+          padding: 12px 14px;
+        }
+        .convert-detail summary::-webkit-details-marker {
+          display: none;
+        }
+        .convert-detail summary i {
+          color: #3D9970;
+          margin-right: 6px;
+        }
+        .convert-detail-body {
+          border-top: 1px solid #dfece6;
+          padding: 12px 14px 2px 14px;
+        }
+        .convert-equal-row {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: stretch;
+        }
+        .convert-equal-row > [class*='col-'] {
+          display: flex;
+        }
+        .convert-equal-row > [class*='col-'] > .card {
+          width: 100%;
+        }
+        .convert-top-card .card-body {
+          min-height: 310px;
+        }
+        .convert-work-row {
+          align-items: flex-start;
+        }
+        .download-tabs .nav-tabs {
+          border-bottom: 1px solid #dfece6;
+          margin-bottom: 12px;
+        }
+        .download-tabs .nav-link {
+          color: #2f7a5a;
+          font-weight: 600;
+        }
+        .download-tabs .nav-link.active {
+          color: #fff;
+          background-color: #3D9970;
+          border-color: #3D9970;
+        }
+        .range-select-row {
+          margin-top: 10px;
+        }
+        .range-select-row .form-group {
+          margin-bottom: 8px;
+        }
+        .range-select-help {
+          color: #5f6b66;
+          font-size: 12px;
+          line-height: 1.5;
+          margin: 4px 0 10px 0;
+        }        .run-btn, .download-btn {
           width: 100%;
           font-weight: 600;
         }
@@ -1084,6 +1421,118 @@ ui <- bs4DashPage(
         )
       ),
       bs4TabItem(
+        tabName = "spatial_convert",
+        fluidRow(
+          column(
+            12,
+            tags$div(
+              class = "convert-banner",
+              icon("triangle-exclamation"),
+              tags$span(
+                tags$strong("注意："),
+                " 若数据为空间截面类型，则须使用此工具进行时空面板类型的转换！若用户已将原始数据转换为时空面板格式/原始数据已经是时空面板数据格式，则可直接进行下一步“数据输入”！"
+              )
+            )
+          )
+        ),
+        tags$div(
+          class = "row convert-equal-row",
+          column(
+            4,
+            bs4Card(
+              width = 12,
+              status = "olive",
+              solidHeader = TRUE,
+              class = "convert-top-card",
+              title = tagList(icon("file-import"), " 原始数据读取"),
+              fileInput("convert_file", "空间截面原始数据（CSV / Excel）", accept = c(".csv", ".xlsx", ".xls")),
+              actionButton("convert_load_file", tagList(icon("folder-open"), " 读取转换数据"), class = "btn btn-success run-btn"),
+              tags$div(
+                class = "model-note",
+                icon("circle-info"),
+                "列名规则不作强制限制。请确保同一个变量的各时间列在原始数据中按时间序列顺序排列，或者在选择时按原始列顺序与时间序列一一对应。"
+              )
+            )
+          ),
+          column(
+            8,
+            bs4Card(
+              width = 12,
+              status = "olive",
+              solidHeader = TRUE,
+              class = "convert-top-card",
+              title = tagList(icon("table"), " 原始数据"),
+              DTOutput("convert_raw_preview")
+            )
+          )
+        ),
+        fluidRow(
+          column(
+            12,
+            bs4Card(
+              width = 12,
+              status = "olive",
+              solidHeader = TRUE,
+              title = tagList(icon("clipboard-check"), " 检查结果"),
+              uiOutput("convert_structure_feedback")
+            )
+          )
+        ),
+        fluidRow(
+          class = "convert-work-row",
+          column(
+            4,
+            bs4Card(
+              width = 12,
+              status = "olive",
+              solidHeader = TRUE,
+              title = tagList(icon("sliders"), " 转换参数"),
+              multi_select("convert_id_cols", "id 列（每个时间点不变，可多选）"),
+              textAreaInput("convert_time_values", "时间序列（数值型）", value = "2000:2021", rows = 2, placeholder = "例如：2000:2021 或 2000,2001,2002 或 1:12"),
+              textInput("convert_time_col", "新时间列名", value = "Year"),
+              numericInput("convert_var_count", "需要转换的变量个数", value = 1, min = 1, max = 20, step = 1),
+              uiOutput("convert_variable_specs"),
+              actionButton("run_panel_convert", tagList(icon("play"), " 开始转换"), class = "btn btn-success run-btn")
+            )
+          ),
+          column(
+            8,
+            bs4Card(
+              width = 12,
+              status = "olive",
+              solidHeader = TRUE,
+              title = tagList(icon("table-columns"), " 转换结果"),
+              DTOutput("converted_panel_preview"),
+              tags$hr(),
+              uiOutput("convert_result_feedback"),
+              tags$div(
+                class = "download-tabs",
+                tabsetPanel(
+                  id = "convert_download_format",
+                  type = "tabs",
+                  tabPanel("CSV", value = "csv"),
+                  tabPanel("Excel xlsx", value = "xlsx"),
+                  tabPanel("Excel xls", value = "xls")
+                )
+              ),
+              downloadButton("download_converted_panel", "下载转换后表格", class = "btn btn-outline-success download-btn")
+            )
+          )
+        ),
+        fluidRow(
+          column(
+            12,
+            tags$div(
+              class = "convert-banner convert-banner-bottom",
+              icon("download"),
+              tags$span("转换完成后，请下载转换后的数据，并使用该数据进入下一步“数据输入”。"),
+              tags$br(),
+              icon("list-check"),
+              tags$span("时空面板数据格式的转换并不代表空间单元顺序与空间地图的单元顺序一致，故仍需进行后续“数据检查”。")
+            )
+          )
+        )
+      ),      bs4TabItem(
         tabName = "input",
         fluidRow(
           column(
@@ -1195,7 +1644,8 @@ server <- function(input, output, session) {
   spatial_matrix <- reactiveVal(NULL)
   checked_bstvc <- reactiveVal(NULL)
   checked_bsvc <- reactiveVal(NULL)
-
+  converter_raw_data <- reactiveVal(NULL)
+  converted_panel_data <- reactiveVal(NULL)
   load_status <- reactiveVal(list(type = "info", lines = "请上传数据和地图后点击“读取并验证输入”。"))
   check_state <- reactiveVal(list(code = "idle", message = "等待检查。", mode = "bstvc"))
   check_history <- reactiveVal(list())
@@ -1205,6 +1655,234 @@ server <- function(input, output, session) {
   output$n_map_units <- renderText({ if (is.null(study_map())) "-" else as.character(nrow(study_map())) })
 
   # 点击读取按钮后才更新响应式数据，避免用户选择文件过程中重复触发大量读取操作。
+
+  convert_status <- reactiveVal(list(
+    type = "info",
+    lines = "请上传空间截面原始数据后点击“读取转换数据”。"
+  ))
+  convert_result_status <- reactiveVal(list(
+    type = "info",
+    lines = "尚未执行转换。"
+  ))
+
+  observeEvent(input$convert_load_file, {
+    if (is.null(input$convert_file)) {
+      convert_status(list(type = "warning", lines = "请先选择 CSV、xlsx 或 xls 原始数据文件。"))
+      return()
+    }
+
+    tryCatch({
+      dat <- safe_read_data(input$convert_file)
+      converter_raw_data(dat)
+      converted_panel_data(NULL)
+      convert_result_status(list(type = "info", lines = "尚未执行转换。"))
+      detected <- detect_panel_data_type(dat)
+      convert_status(list(
+        type = detected$class,
+        lines = c(
+          sprintf("原始数据读取成功：%d 行，%d 列。", nrow(dat), ncol(dat)),
+          detected$lines
+        )
+      ))
+    }, error = function(e) {
+      converter_raw_data(NULL)
+      converted_panel_data(NULL)
+      convert_result_status(list(type = "info", lines = "尚未执行转换。"))
+      convert_status(list(type = "danger", lines = paste("原始数据读取失败：", conditionMessage(e))))
+    })
+  }, ignoreInit = TRUE)
+
+  observe({
+    dat <- converter_raw_data()
+    cols <- if (is.null(dat)) character(0) else names(dat)
+    updateSelectizeInput(session, "convert_id_cols", choices = cols, selected = input$convert_id_cols %||% character(0))
+
+    n_vars <- input$convert_var_count %||% 1
+    range_choices <- c("请选择" = "", cols)
+    for (i in seq_len(n_vars)) {
+      updateSelectizeInput(
+        session,
+        paste0("convert_measure_", i),
+        choices = cols,
+        selected = input[[paste0("convert_measure_", i)]] %||% character(0)
+      )
+      updateSelectInput(
+        session,
+        paste0("convert_measure_start_", i),
+        choices = range_choices,
+        selected = input[[paste0("convert_measure_start_", i)]] %||% ""
+      )
+      updateSelectInput(
+        session,
+        paste0("convert_measure_end_", i),
+        choices = range_choices,
+        selected = input[[paste0("convert_measure_end_", i)]] %||% ""
+      )
+    }
+  })
+
+
+  for (range_i in seq_len(20)) {
+    local({
+      i <- range_i
+      observeEvent(input[[paste0("convert_apply_measure_range_", i)]], {
+        dat <- converter_raw_data()
+        cols <- if (is.null(dat)) character(0) else names(dat)
+        start_col <- input[[paste0("convert_measure_start_", i)]] %||% ""
+        end_col <- input[[paste0("convert_measure_end_", i)]] %||% ""
+
+        if (length(cols) == 0) {
+          showNotification("请先读取原始数据，再按范围选择列。", type = "warning")
+          return()
+        }
+        if (!nzchar(start_col) || !nzchar(end_col)) {
+          showNotification("请选择起始列和终止列。", type = "warning")
+          return()
+        }
+        if (!start_col %in% cols || !end_col %in% cols) {
+          showNotification("起始列或终止列不在原始数据中。", type = "error")
+          return()
+        }
+
+        start_pos <- match(start_col, cols)
+        end_pos <- match(end_col, cols)
+        selected_cols <- cols[seq(min(start_pos, end_pos), max(start_pos, end_pos))]
+
+        updateSelectizeInput(session, paste0("convert_measure_", i), selected = selected_cols)
+        showNotification(
+          paste0("已按原始数据列顺序选中 ", length(selected_cols), " 列。"),
+          type = "message"
+        )
+      }, ignoreInit = TRUE)
+    })
+  }
+  output$convert_variable_specs <- renderUI({
+    dat <- converter_raw_data()
+    cols <- if (is.null(dat)) character(0) else names(dat)
+    n_vars <- input$convert_var_count %||% 1
+
+    tagList(lapply(seq_len(n_vars), function(i) {
+      do.call(
+        tags$details,
+        c(
+          list(class = "slice-panel convert-detail"),
+          if (i == 1) list(open = "open") else list(),
+          list(
+            tags$summary(icon("chevron-right"), paste0("变量 ", i)),
+            tags$div(
+              class = "convert-detail-body",
+              textInput(paste0("convert_value_name_", i), "转换后的数值列名", value = if (i == 1) "Value" else paste0("Value", i)),
+              multi_select(paste0("convert_measure_", i), "该变量对应的时间序列列", choices = cols),
+              tags$div(
+                class = "range-select-row",
+                fluidRow(
+                  column(6, selectInput(paste0("convert_measure_start_", i), "起始列", choices = c("请选择" = "", cols))),
+                  column(6, selectInput(paste0("convert_measure_end_", i), "终止列", choices = c("请选择" = "", cols)))
+                ),
+                actionButton(paste0("convert_apply_measure_range_", i), tagList(icon("wand-magic-sparkles"), " 按范围选择"), class = "btn btn-outline-success run-btn"),
+                tags$div(class = "range-select-help", "选择起始列和终止列后，系统会按原始数据中的列顺序一次性选中这一区间内的全部列。")
+              )
+            )
+          )
+        )
+      )
+    }))
+  })
+
+  output$convert_raw_preview <- renderDT({
+    dat <- converter_raw_data()
+    req(dat)
+    DT::datatable(dat, rownames = FALSE, options = list(pageLength = 8, scrollX = TRUE))
+  })
+
+  output$convert_structure_feedback <- renderUI({
+    dat <- converter_raw_data()
+    if (is.null(dat)) {
+      st <- convert_status()
+      return(div(
+        class = paste("alert convert-type-alert", paste0("alert-", st$type)),
+        tags$h4(icon("clipboard-check"), " 数据类型检查"),
+        lapply(st$lines, tags$p)
+      ))
+    }
+
+    detected <- detect_panel_data_type(dat)
+    div(
+      class = paste("alert convert-type-alert", paste0("alert-", detected$class)),
+      tags$h4(icon("clipboard-check"), " 数据类型检查"),
+      lapply(detected$lines, tags$p)
+    )
+  })
+
+  observeEvent(input$run_panel_convert, {
+    dat <- converter_raw_data()
+
+    tryCatch({
+      withProgress(message = "空间截面数据转换进度", value = 0, {
+        incProgress(0.15, detail = "检查转换参数")
+        time_values <- parse_numeric_time_sequence(input$convert_time_values)
+        n_vars <- input$convert_var_count %||% 1
+        specs <- lapply(seq_len(n_vars), function(i) {
+          list(
+            value_name = input[[paste0("convert_value_name_", i)]],
+            measure_cols = input[[paste0("convert_measure_", i)]] %||% character(0)
+          )
+        })
+
+        incProgress(0.35, detail = "检查各变量时间序列长度")
+        converted <- build_panel_conversion(
+          dat = dat,
+          id_cols = input$convert_id_cols %||% character(0),
+          time_values = time_values,
+          time_col = input$convert_time_col,
+          specs = specs
+        )
+
+        incProgress(0.30, detail = "生成时空面板表格")
+        converted_panel_data(converted)
+        incProgress(0.20, detail = "完成")
+      })
+
+      convert_result_status(list(
+        type = "success",
+        lines = c(
+          sprintf("转换完成：已生成 %d 行，%d 列的时空面板数据。", nrow(converted_panel_data()), ncol(converted_panel_data())),
+          "请下载转换后的数据，并使用该数据进行下一步“数据输入”。",
+          "注意：格式转换不代表空间单元顺序与空间地图单元顺序一致，仍需进行后续“数据检查”。"
+        )
+      ))
+    }, error = function(e) {
+      converted_panel_data(NULL)
+      convert_result_status(list(type = "danger", lines = conditionMessage(e)))
+    })
+  }, ignoreInit = TRUE)
+
+  output$converted_panel_preview <- renderDT({
+    dat <- converted_panel_data()
+    req(dat)
+    DT::datatable(dat, rownames = FALSE, options = list(pageLength = 8, scrollX = TRUE))
+  })
+
+
+  output$convert_result_feedback <- renderUI({
+    st <- convert_result_status()
+    div(
+      class = paste("alert", paste0("alert-", st$type)),
+      lapply(st$lines, tags$p)
+    )
+  })
+
+  output$download_converted_panel <- downloadHandler(
+    filename = function() {
+      fmt <- input$convert_download_format %||% "csv"
+      paste0("BSTVC_panel_converted_", format(Sys.Date(), "%Y%m%d"), ".", fmt)
+    },
+    content = function(file) {
+      dat <- converted_panel_data()
+      req(dat)
+      write_single_result_table(dat, file, input$convert_download_format %||% "csv")
+    }
+  )
   observeEvent(input$load_resources, {
     msgs <- character(0)
     has_error <- FALSE
